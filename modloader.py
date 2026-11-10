@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from io import BytesIO
 import json
 import os
 from contextlib import contextmanager
@@ -12,15 +13,25 @@ import subprocess
 import tempfile
 from zipfile import ZipFile
 
+from PIL import Image
+
 from skybox import DDS_BYTES, PATHS, valid_dds
 
 CURSORS = "content/textures/Cursors/KeyboardMouse/"
+CURSOR_ROOT = "content/textures/Cursors/"
+MAX_ZIP_BYTES = 16 * 1024 * 1024
 ASSETS = {
     CURSORS + "ArrowCursor.png": 256 * 1024,
     CURSORS + "ArrowFarCursor.png": 256 * 1024,
     CURSORS + "IBeamCursor.png": 256 * 1024,
     "content/textures/ArrowCursor.png": 256 * 1024,
     "content/textures/ArrowFarCursor.png": 256 * 1024,
+    **{CURSOR_ROOT + path: 256 * 1024 for path in (
+        "FocusLocation.png", "DragDetector/ActivatedCursor.png", "DragDetector/HoverCursor.png",
+        "Gamepad/IBeamCursor.png", "Gamepad/Pointer.png", "Gamepad/Pointer@2x.png",
+        "Gamepad/PointerOver.png", "Gamepad/PointerOver@2x.png",
+    )},
+    "content/sounds/oof.ogg": 2 * 1024 * 1024,
     "content/sounds/ouch.ogg": 2 * 1024 * 1024,
     "content/sounds/volume_slider.ogg": 2 * 1024 * 1024,
     **dict.fromkeys(PATHS.values(), DDS_BYTES),
@@ -88,6 +99,11 @@ def validate_asset(path, data):
         width, height = struct.unpack_from(">II", data, 16)
         if not (1 <= width <= 128 and 1 <= height <= 128):
             raise ValueError(f"Размер PNG должен быть не больше 128×128: {path}")
+        try:
+            with Image.open(BytesIO(data), formats=("PNG",)) as image:
+                image.verify()
+        except (OSError, SyntaxError, ValueError) as exc:
+            raise ValueError(f"Повреждённый PNG: {path}") from exc
     elif path in SKY_TEXTURES:
         if not valid_dds(data):
             raise ValueError(f"Для неба нужен DDS DXT1 1024×1024 с 11 уровнями: {path}")
@@ -102,14 +118,24 @@ def require_complete_skybox(pack):
         raise ValueError("Для неба нужны все шесть текстур.")
 
 
+def validate_pack(pack):
+    if not pack:
+        raise ValueError("Пак не содержит поддерживаемых ресурсов.")
+    require_complete_skybox(pack)
+    for name, data in pack.items():
+        if name not in ASSETS:
+            raise ValueError(f"Неподдерживаемый ресурс: {name}")
+        validate_asset(name, data)
+
+
 def read_pack(archive):
-    if archive.stat().st_size > 8 * 1024 * 1024:
-        raise ValueError("ZIP должен быть не больше 8 МиБ.")
+    if archive.stat().st_size > MAX_ZIP_BYTES:
+        raise ValueError("ZIP должен быть не больше 16 МиБ.")
     with ZipFile(archive) as bundle:
         entries = bundle.infolist()
         if len(entries) > 64:
             raise ValueError("В ZIP должно быть не больше 64 записей.")
-        pack = {}
+        files = []
         for info in entries:
             name = info.filename
             parts = name.rstrip("/").split("/")
@@ -117,20 +143,47 @@ def read_pack(archive):
                 raise ValueError("В ZIP есть недопустимый путь.")
             if stat.S_ISLNK(info.external_attr >> 16):
                 raise ValueError("Ссылки в ZIP запрещены.")
-            if info.is_dir():
-                continue
+            if not info.is_dir():
+                files.append(info)
+        prefixes = {info.filename.split("/", 1)[0].lower() for info in files}
+        wrapper = len(prefixes) == 1 and not prefixes.intersection({"content", "platformcontent"})
+        pack = {}
+        for info in files:
+            name = info.filename.partition("/")[2] if wrapper else info.filename
             path = CANONICAL.get(name.lower())
             if not path:
-                raise ValueError(f"Неподдерживаемый файл в ZIP: {name}")
+                raise ValueError(f"Неподдерживаемый файл в ZIP: {info.filename}")
             if path in pack or info.file_size > ASSETS[path] or info.flag_bits & 1:
                 raise ValueError(f"Дубликат, шифрование или превышен размер: {name}")
             with bundle.open(info) as member:
-                data = member.read(ASSETS[path] + 1)
-            validate_asset(path, data)
-            pack[path] = data
-    if not pack:
-        raise ValueError("ZIP не содержит поддерживаемых ресурсов.")
-    require_complete_skybox(pack)
+                pack[path] = member.read(ASSETS[path] + 1)
+    validate_pack(pack)
+    return pack
+
+
+def raise_walk_error(error):
+    raise error
+
+
+def read_folder(folder):
+    reject_link(folder)
+    pack = {}
+    for parent, dirs, files in os.walk(folder, onerror=raise_walk_error, followlinks=False):
+        directory = Path(parent)
+        for name in dirs:
+            reject_link(directory / name)
+        for name in files:
+            file = directory / name
+            reject_link(file)
+            relative = file.relative_to(folder).as_posix()
+            path = CANONICAL.get(relative.lower())
+            if not path:
+                raise ValueError(f"Неподдерживаемый файл в папке: {relative}")
+            if path in pack or not file.is_file() or file.stat().st_size > ASSETS[path]:
+                raise ValueError(f"Дубликат или недопустимый файл: {relative}")
+            with file.open("rb") as source:
+                pack[path] = source.read(ASSETS[path] + 1)
+    validate_pack(pack)
     return pack
 
 
@@ -204,29 +257,58 @@ class Manager:
     def active(self, target):
         return self.journal_path(target).is_file()
 
+    def inspect(self, target, pack):
+        validate_pack(pack)
+        rows = []
+        for name, data in pack.items():
+            installed = checked_path(target.version, name)
+            destination = checked_path(target.destination, name)
+            if not installed.is_file():
+                rows.append((name, "отсутствует в Player", None))
+                continue
+            previous = read_existing(destination)
+            if previous == data:
+                action = "совпадает"
+            elif previous is None:
+                action = "добавить"
+            else:
+                action = "заменить"
+            rows.append((name, action, previous))
+        return rows
+
+    def health(self, target):
+        journal = self.journal_path(target)
+        if not journal.is_file():
+            return []
+        rows = []
+        for name, entry in json.loads(journal.read_text(encoding="ascii")).items():
+            destination = checked_path(target.destination, name)
+            current = read_existing(destination)
+            before = entry["before"]
+            original = None if before is None else base64.b64decode(before, validate=True)
+            if current == original:
+                state = "исходный файл"
+            elif digest(current) == entry["after"]:
+                state = "активен"
+            else:
+                state = "конфликт"
+            rows.append((name, state))
+        return rows
+
     def apply(self, target, pack):
         with exclusive(self.state_dir / "operation.lock"):
             self.ensure_closed()
             journal = self.journal_path(target)
             if journal.exists():
                 raise ValueError("Сначала восстанови предыдущий пак для этой установки.")
-            require_complete_skybox(pack)
             entries = {}
-            for name, data in pack.items():
-                installed = checked_path(target.version, name)
-                if not installed.is_file():
+            for name, action, previous in self.inspect(target, pack):
+                if action == "отсутствует в Player" or (previous is None and not target.overlay):
                     raise ValueError(f"В этой версии Player отсутствует ресурс: {name}")
-                destination = checked_path(target.destination, name)
-                validate_asset(name, data)
-                previous = read_existing(destination)
-                if previous is None and not target.overlay:
-                    raise ValueError(f"Исходный ресурс исчез: {name}")
                 entries[name] = {
                     "before": base64.b64encode(previous).decode("ascii") if previous is not None else None,
-                    "after": digest(data),
+                    "after": digest(pack[name]),
                 }
-            if not entries:
-                raise ValueError("Пак пуст.")
             atomic_write(journal, json.dumps(entries).encode("ascii"))
             try:
                 for name, data in pack.items():
