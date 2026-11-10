@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 from zipfile import ZipFile
 
+from skybox import DDS_BYTES, PATHS, valid_dds
+
 CURSORS = "content/textures/Cursors/KeyboardMouse/"
 ASSETS = {
     CURSORS + "ArrowCursor.png": 256 * 1024,
@@ -21,7 +23,9 @@ ASSETS = {
     "content/textures/ArrowFarCursor.png": 256 * 1024,
     "content/sounds/ouch.ogg": 2 * 1024 * 1024,
     "content/sounds/volume_slider.ogg": 2 * 1024 * 1024,
+    **dict.fromkeys(PATHS.values(), DDS_BYTES),
 }
+SKY_TEXTURES = frozenset(PATHS.values())
 CANONICAL = {path.lower(): path for path in ASSETS}
 VERSION_PATTERN = re.compile(r"version-[a-f0-9]+")
 
@@ -84,9 +88,18 @@ def validate_asset(path, data):
         width, height = struct.unpack_from(">II", data, 16)
         if not (1 <= width <= 128 and 1 <= height <= 128):
             raise ValueError(f"Размер PNG должен быть не больше 128×128: {path}")
+    elif path in SKY_TEXTURES:
+        if not valid_dds(data):
+            raise ValueError(f"Для неба нужен DDS DXT1 1024×1024 с 11 уровнями: {path}")
     else:
         if len(data) < 34 or data[:5] != b"OggS\x00" or not data[27 + data[26]:].startswith(b"\x01vorbis"):
             raise ValueError(f"Ожидался Ogg Vorbis: {path}")
+
+
+def require_complete_skybox(pack):
+    included = SKY_TEXTURES.intersection(pack)
+    if included and included != SKY_TEXTURES:
+        raise ValueError("Для неба нужны все шесть текстур.")
 
 
 def read_pack(archive):
@@ -117,6 +130,7 @@ def read_pack(archive):
             pack[path] = data
     if not pack:
         raise ValueError("ZIP не содержит поддерживаемых ресурсов.")
+    require_complete_skybox(pack)
     return pack
 
 
@@ -196,6 +210,7 @@ class Manager:
             journal = self.journal_path(target)
             if journal.exists():
                 raise ValueError("Сначала восстанови предыдущий пак для этой установки.")
+            require_complete_skybox(pack)
             entries = {}
             for name, data in pack.items():
                 installed = checked_path(target.version, name)

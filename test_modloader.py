@@ -1,10 +1,14 @@
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from modloader import CURSORS, Manager, Target, detect, read_pack
+from PIL import Image
+
+from modloader import CURSORS, Manager, detect, read_pack
+from skybox import PATHS, build_skybox, valid_dds
 
 EXAMPLE = Path(__file__).parent / "examples/PurpleCursor.zip"
 
@@ -91,3 +95,40 @@ class ModLoaderTest(TestCase):
                         bundle.writestr(name.upper(), data)
                 with self.assertRaises(ValueError):
                     read_pack(archive)
+
+    def test_skybox_builds_all_sides_and_round_trips(self):
+        images = self.root / "images"
+        images.mkdir()
+        for face in PATHS:
+            Image.new("RGB", (64, 64), (90, 20, 160)).save(images / (face + ".png"))
+        pack = build_skybox(images)
+        self.assertEqual(set(pack), set(PATHS.values()))
+        with Image.open(BytesIO(pack[PATHS["up"]])) as face:
+            self.assertEqual(face.size, (1024, 1024))
+            self.assertGreater(face.getpixel((0, 0))[2], 140)
+        archive = self.root / "sky.zip"
+        with ZipFile(archive, "w") as bundle:
+            for path, data in pack.items():
+                bundle.writestr(path, data)
+        self.assertEqual(read_pack(archive), pack)
+        self.pack = pack
+        target = self.make_install("Bloxstrap")
+        self.manager.apply(target, pack)
+        self.assertTrue(valid_dds((target.destination / PATHS["up"]).read_bytes()))
+        self.manager.restore(target)
+        self.assertFalse((target.destination / PATHS["up"]).exists())
+
+    def test_rejects_partial_skybox_and_corrupt_texture(self):
+        images = self.root / "images"
+        images.mkdir()
+        with self.assertRaisesRegex(ValueError, "bk"):
+            build_skybox(images)
+        from skybox import encode_dds
+        data = encode_dds(Image.new("RGB", (64, 64)))
+        self.assertFalse(valid_dds(data[:-1]))
+        self.assertFalse(valid_dds(data[:84] + b"DX10" + data[88:]))
+        archive = self.root / "partial.zip"
+        with ZipFile(archive, "w") as bundle:
+            bundle.writestr(PATHS["bk"], data)
+        with self.assertRaisesRegex(ValueError, "шесть"):
+            read_pack(archive)

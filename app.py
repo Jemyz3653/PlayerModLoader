@@ -5,9 +5,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from zipfile import BadZipFile
 
-from modloader import Manager, detect, read_pack
+from PIL import Image
 
-VERSION = "0.1.0"
+from modloader import Manager, detect, read_pack
+from skybox import build_skybox
+
+VERSION = "0.2.0"
 
 
 class App:
@@ -34,7 +37,7 @@ class App:
         frame = ttk.Frame(window, padding=22)
         frame.pack(expand=True, fill="both")
         ttk.Label(frame, text="PlayerModLoader", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="Косметические ZIP-паки для Roblox Player").pack(anchor="w", pady=(0, 14))
+        ttk.Label(frame, text="Скайбоксы, курсоры и звуки для Roblox Player").pack(anchor="w", pady=(0, 14))
         target_row = ttk.Frame(frame)
         target_row.pack(fill="x", pady=(0, 10))
         self.selector = ttk.Combobox(target_row, state="readonly")
@@ -44,9 +47,13 @@ class App:
         self.files = tk.Listbox(frame, height=7, bg="#242638", fg="#f1f0ff",
                                 highlightthickness=0, relief="flat", font=("Consolas", 10))
         self.files.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient="horizontal", command=self.files.xview)
+        scrollbar.pack(fill="x")
+        self.files.configure(xscrollcommand=scrollbar.set)
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=10)
         ttk.Button(row, text="Открыть ZIP", command=self.choose).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Собрать небо", command=self.choose_sky).pack(side="left", padx=(0, 8))
         self.apply_button = ttk.Button(row, text="Применить", command=self.apply)
         self.apply_button.pack(side="left", padx=(0, 8))
         self.restore_button = ttk.Button(row, text="Восстановить", command=self.restore)
@@ -87,7 +94,7 @@ class App:
         elif target is None:
             message = "Player не найден. Поддерживаются установки Roblox с сайта и Bloxstrap."
         else:
-            message = "Выбери ZIP-пак и закрой Player перед применением."
+            message = "Открой ZIP или собери небо. Перед применением закрой Player."
         self.status.set(message)
 
     def choose(self):
@@ -99,9 +106,28 @@ class App:
         except (OSError, ValueError, BadZipFile, RuntimeError, NotImplementedError) as exc:
             messagebox.showerror("Импорт ZIP", str(exc), parent=self.window)
             return
+        self.show_pack(Path(filename).name, pack)
+
+    def choose_sky(self):
+        directory = filedialog.askdirectory(parent=self.window,
+            title="Папка с bk, dn, ft, lf, rt и up в PNG или JPEG")
+        if not directory:
+            return
+        try:
+            self.window.configure(cursor="watch")
+            self.window.update_idletasks()
+            pack = build_skybox(Path(directory))
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            messagebox.showerror("Сборка неба", str(exc), parent=self.window)
+            return
+        finally:
+            self.window.configure(cursor="")
+        self.show_pack(Path(directory).name, pack)
+
+    def show_pack(self, name, pack):
         self.pack = pack
         self.files.delete(0, "end")
-        self.files.insert("end", Path(filename).name, *pack)
+        self.files.insert("end", name, *pack)
         self.refresh()
 
     def apply(self):
